@@ -1,0 +1,11 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType    = "on_failure"
+restartPolicyMaxRetries = 3
+
+# Persistent volume mounted at /data — the SQLite database lives at /data/messages.db.
+# Railway creates the volume automatically on first deploy if it does not already exist.
+[[mounts]]
+mountPath = "/data"
