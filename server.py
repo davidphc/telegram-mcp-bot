@@ -1,11 +1,30 @@
 import asyncio
 import os
 import sqlite3
+import sys
 import threading
+import time
 from datetime import datetime, timedelta, time as dtime, timezone
 
 import httpx
 from fastmcp import FastMCP
+
+try:
+    from zoneinfo import ZoneInfo
+    _PT_TZ = ZoneInfo("America/Los_Angeles")
+except Exception:
+    # Fallback if the zoneinfo/tzdata database isn't available on this system.
+    # This approximates Pacific Daylight Time (UTC-7) and won't auto-adjust
+    # for standard time (UTC-8), but keeps the daily sync roughly on schedule.
+    _PT_TZ = timezone(timedelta(hours=-7))
+
+_DAILY_SYNC_HOUR_PT = 14  # 2pm PT
+_MICRO_SYNC_INTERVAL_SECONDS = 30 * 60  # every 30 minutes
+_THREAD_RESTART_DELAY_SECONDS = 30
+
+
+def _log(msg: str) -> None:
+    print(f"[poll] {msg}", file=sys.stderr, flush=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -145,40 +164,96 @@ async def fetch_and_store() -> int:
     return total
 
 
-async def _poll_forever() -> None:
+def _next_daily_sync_at(now_utc: datetime) -> datetime:
     """
-    Fetch on startup (covers any gap since the last run), then sleep until the
-    next midnight UTC and repeat — one fetch per day.
+    Return the next 2pm Pacific Time occurrence (converted to UTC) after `now_utc`.
+    Handles PDT/PST transitions automatically when zoneinfo/tzdata is available.
     """
-    try:
-        await fetch_and_store()
-    except Exception:
-        pass  # don't abort the loop on a transient startup error
+    now_pt = now_utc.astimezone(_PT_TZ)
+    candidate_pt = now_pt.replace(
+        hour=_DAILY_SYNC_HOUR_PT, minute=0, second=0, microsecond=0
+    )
+    if candidate_pt <= now_pt:
+        candidate_pt += timedelta(days=1)
+    return candidate_pt.astimezone(timezone.utc)
 
+
+async def _micro_sync_loop() -> None:
+    """
+    Every _MICRO_SYNC_INTERVAL_SECONDS, attempt a quick incremental fetch so
+    messages sent between the daily syncs still show up promptly. Failures
+    here are logged but never propagate — this loop must not die.
+    """
+    while True:
+        await asyncio.sleep(_MICRO_SYNC_INTERVAL_SECONDS)
+        try:
+            n = await fetch_and_store()
+            if n:
+                _log(f"micro-sync stored {n} new message(s)")
+        except Exception as exc:
+            _log(f"micro-sync failed (will retry in {_MICRO_SYNC_INTERVAL_SECONDS}s): {exc!r}")
+
+
+async def _daily_sync_loop() -> None:
+    """
+    Sleep until the next 2pm PT (9pm UTC during PDT) and run a full sync,
+    then repeat forever. Errors are logged and never stop the loop.
+    """
     while True:
         now = datetime.now(timezone.utc)
-        next_midnight = datetime.combine(
-            now.date() + timedelta(days=1),
-            dtime(0, 0),
-            tzinfo=timezone.utc,
-        )
-        await asyncio.sleep((next_midnight - now).total_seconds())
+        next_sync = _next_daily_sync_at(now)
+        sleep_seconds = max((next_sync - now).total_seconds(), 0)
+        _log(f"next daily sync scheduled for {next_sync.isoformat()} ({sleep_seconds:.0f}s from now)")
+        await asyncio.sleep(sleep_seconds)
 
         try:
-            await fetch_and_store()
-        except Exception:
-            pass  # keep running even if Telegram is briefly unavailable
+            n = await fetch_and_store()
+            _log(f"daily sync stored {n} new message(s)")
+        except Exception as exc:
+            _log(f"daily sync failed: {exc!r}")
+
+
+async def _poll_forever() -> None:
+    """
+    Fetch on startup (covers any gap since the last run), then run the daily
+    2pm PT sync and the 30-minute micro-sync concurrently, forever.
+    """
+    try:
+        n = await fetch_and_store()
+        _log(f"startup sync stored {n} new message(s)")
+    except Exception as exc:
+        _log(f"startup sync failed: {exc!r}")  # don't abort the loop on a transient startup error
+
+    await asyncio.gather(_daily_sync_loop(), _micro_sync_loop())
 
 
 def _start_poll_thread() -> None:
-    """Run the async poll loop in a dedicated daemon thread with its own event loop."""
+    """
+    Run the async poll loop in a dedicated daemon thread with its own event loop.
+
+    The loop is wrapped in a restart supervisor: if `_poll_forever()` ever raises
+    (which it shouldn't, given the internal try/except blocks) or the event loop
+    itself dies, the thread logs the failure, waits briefly, and spins up a fresh
+    event loop rather than exiting silently. This guarantees syncing keeps
+    happening even after unexpected errors.
+    """
     def runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_poll_forever())
-        finally:
-            loop.close()
+        while True:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(_poll_forever())
+                finally:
+                    loop.close()
+            except Exception as exc:
+                _log(f"poll thread crashed, restarting in {_THREAD_RESTART_DELAY_SECONDS}s: {exc!r}")
+                time.sleep(_THREAD_RESTART_DELAY_SECONDS)
+            else:
+                # _poll_forever() should never return normally (it's an infinite
+                # loop), but if it somehow does, restart rather than exit.
+                _log(f"poll loop exited unexpectedly, restarting in {_THREAD_RESTART_DELAY_SECONDS}s")
+                time.sleep(_THREAD_RESTART_DELAY_SECONDS)
 
     threading.Thread(target=runner, daemon=True, name="poll-thread").start()
 
@@ -220,6 +295,21 @@ def search_messages(keyword: str, days: int = 7, limit: int = 200) -> list[dict]
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@mcp.tool()
+async def sync_now() -> dict:
+    """
+    Trigger an immediate sync with Telegram instead of waiting for the next
+    scheduled poll. Returns the number of new messages stored.
+    """
+    try:
+        n = await fetch_and_store()
+        _log(f"manual sync_now stored {n} new message(s)")
+        return {"status": "ok", "new_messages": n}
+    except Exception as exc:
+        _log(f"manual sync_now failed: {exc!r}")
+        return {"status": "error", "error": str(exc)}
 
 
 @mcp.tool()
