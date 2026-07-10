@@ -1,7 +1,6 @@
 import asyncio
 import os
 import sqlite3
-import threading
 from datetime import datetime, timedelta, time as dtime, timezone
 
 import httpx
@@ -145,10 +144,25 @@ async def fetch_and_store() -> int:
     return total
 
 
+DAILY_RUN_TIME_UTC = dtime(21, 0)  # 2pm PT == 9pm UTC
+
+
+def _next_run_at(now: datetime) -> datetime:
+    """Return the next occurrence of DAILY_RUN_TIME_UTC (today if still ahead, else tomorrow)."""
+    candidate = datetime.combine(now.date(), DAILY_RUN_TIME_UTC, tzinfo=timezone.utc)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 async def _poll_forever() -> None:
     """
     Fetch on startup (covers any gap since the last run), then sleep until the
-    next midnight UTC and repeat — one fetch per day.
+    next 2pm PT (9pm UTC) and repeat — one fetch per day.
+
+    This coroutine is scheduled as an asyncio task owned by the server's event
+    loop (see `main()`), so it runs for the lifetime of the process rather than
+    a daemon thread that can silently die independently of the server.
     """
     try:
         await fetch_and_store()
@@ -157,30 +171,13 @@ async def _poll_forever() -> None:
 
     while True:
         now = datetime.now(timezone.utc)
-        next_midnight = datetime.combine(
-            now.date() + timedelta(days=1),
-            dtime(0, 0),
-            tzinfo=timezone.utc,
-        )
-        await asyncio.sleep((next_midnight - now).total_seconds())
+        next_run = _next_run_at(now)
+        await asyncio.sleep((next_run - now).total_seconds())
 
         try:
             await fetch_and_store()
         except Exception:
             pass  # keep running even if Telegram is briefly unavailable
-
-
-def _start_poll_thread() -> None:
-    """Run the async poll loop in a dedicated daemon thread with its own event loop."""
-    def runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_poll_forever())
-        finally:
-            loop.close()
-
-    threading.Thread(target=runner, daemon=True, name="poll-thread").start()
 
 # ── MCP tools ──────────────────────────────────────────────────────────────────
 
@@ -275,8 +272,22 @@ async def get_chat_info() -> dict:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+async def main() -> None:
     init_db()
-    _start_poll_thread()
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+
+    # Schedule the daily poll loop as an asyncio task owned by this event loop,
+    # rather than a daemon thread. Daemon threads are killed the instant the
+    # process is torn down and are not tied into the server's own lifecycle,
+    # which meant a restart (or a subtly-crashed thread) could silently stop
+    # polling forever. A task scheduled on the same loop that drives the MCP
+    # server runs for as long as the server itself runs, and is restarted
+    # along with it on every deploy — so there is no separate lifecycle to
+    # fall out of sync.
+    asyncio.create_task(_poll_forever(), name="telegram-poll-task")
+
+    await mcp.run_async(transport="sse", host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
