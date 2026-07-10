@@ -9,7 +9,7 @@ An MCP server that connects to a Telegram group chat via the Telegram Bot API, p
 ```
 Telegram Bot API
       │
-      │  getUpdates (daily at midnight UTC + on startup)
+      │  getUpdates (daily at 2pm PT / 9pm UTC + on startup)
       ▼
  SQLite DB  (/data/messages.db)
       │
@@ -18,7 +18,7 @@ Telegram Bot API
  MCP tools  ──SSE──►  Claude / MCP client
 ```
 
-- A **background thread** runs a daily fetch at midnight UTC. On startup it also fetches immediately to cover any gap since the last run.
+- A background **asyncio task**, scheduled on the MCP server's own event loop at startup, runs a daily fetch at 2pm PT (9pm UTC). On startup it also fetches immediately to cover any gap since the last run. Because the task lives on the same event loop that drives the server, it runs for as long as the server process runs and is restarted along with it on every deploy — it can no longer be silently killed independently of the server the way a daemon thread could.
 - Each fetch drains the Telegram update queue and writes new messages to SQLite, deduplicating by `message_id`.
 - The **MCP tools** (`get_recent_messages`, `search_messages`) query the local database — not Telegram — so they can return any time range within the stored history.
 
