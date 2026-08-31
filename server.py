@@ -134,6 +134,8 @@ async def fetch_and_store() -> int:
     last_update_id = int(_get_state("last_update_id", "0"))
     total = 0
 
+    _log(f"fetch_and_store starting, last_update_id={last_update_id}, CHAT_ID={CHAT_ID!r}")
+
     while True:
         params: dict = {
             "limit": 100,
@@ -142,24 +144,51 @@ async def fetch_and_store() -> int:
         if last_update_id > 0:
             params["offset"] = last_update_id + 1
 
+        _log(f"calling getUpdates with params={params}")
         updates = await _call("getUpdates", params)
+
+        update_ids = [u.get("update_id") for u in updates]
+        _log(
+            f"getUpdates returned {len(updates)} update(s); "
+            f"first update_ids={update_ids[:5]}"
+        )
+
         if not updates:
+            _log("getUpdates returned no updates, stopping loop")
             break
 
         rows: list[dict] = []
         for u in updates:
             msg = u.get("message") or u.get("channel_post")
-            if msg and str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
+            if msg is None:
+                _log(f"update_id={u.get('update_id')} has no message/channel_post, skipping")
+                last_update_id = max(last_update_id, u["update_id"])
+                continue
+
+            msg_chat_id = msg.get("chat", {}).get("id")
+            _log(f"update_id={u.get('update_id')} message.chat.id={msg_chat_id!r}")
+
+            if str(msg_chat_id) == str(CHAT_ID):
+                _log(f"update_id={u.get('update_id')} accepted (chat.id matches CHAT_ID)")
                 rows.append(_fmt_msg(msg))
+            else:
+                _log(
+                    f"update_id={u.get('update_id')} filtered out "
+                    f"(chat.id={msg_chat_id!r} != CHAT_ID={CHAT_ID!r})"
+                )
+
             last_update_id = max(last_update_id, u["update_id"])
 
+        _log(f"storing {len(rows)} message(s) from this batch")
         _store_messages(rows)
         total += len(rows)
         _set_state("last_update_id", str(last_update_id))
+        _log(f"updated last_update_id to {last_update_id}")
 
         if len(updates) < 100:
             break
 
+    _log(f"fetch_and_store finished, total stored={total}, final last_update_id={last_update_id}")
     return total
 
 
