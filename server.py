@@ -392,6 +392,17 @@ async def get_chat_info() -> dict:
     return {k: v for k, v in info.items() if v is not None}
 
 
+@mcp.tool()
+async def get_webhook_info() -> dict:
+    """
+    Check the webhook configuration for this bot token. If a webhook is set,
+    it blocks polling mode from working — updates are only delivered to the webhook URL.
+    Returns the current webhook configuration or an empty dict if no webhook is set.
+    """
+    result = await _call("getWebhookInfo", {})
+    return result
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
