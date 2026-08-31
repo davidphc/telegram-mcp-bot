@@ -177,6 +177,20 @@ async def fetch_and_store() -> int:
 
         rows: list[dict] = []
         for u in updates:
+            # Log the chat_id of every single incoming update, completely
+            # unfiltered, before any CHAT_ID matching happens below. This is
+            # a debugging aid to confirm which chat_id(s) Telegram is
+            # actually delivering for this bot token (e.g. to check whether
+            # a new test group's updates are arriving at all).
+            _any_msg = (
+                u.get("message")
+                or u.get("channel_post")
+                or u.get("edited_message")
+                or u.get("edited_channel_post")
+            )
+            _raw_chat_id = _any_msg.get("chat", {}).get("id") if _any_msg else None
+            _log(f"[poll] received update from chat: {_raw_chat_id}")
+
             msg = u.get("message") or u.get("channel_post")
             if msg is None:
                 _log(f"update_id={u.get('update_id')} has no message/channel_post, skipping")
