@@ -112,6 +112,24 @@ async def _call(method: str, payload: dict | None = None) -> object:
         return body["result"]
 
 
+def _log_webhook_info() -> None:
+    """
+    Call Telegram's getWebhookInfo endpoint directly and log the full JSON
+    response. This is a debugging aid: if a webhook is configured, Telegram
+    will not deliver updates via getUpdates, so polling mode will silently
+    receive 0 updates. Logging this on startup makes that diagnosis possible
+    without requiring the get_webhook_info MCP tool to be available.
+    """
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get(f"{_BASE}/getWebhookInfo")
+            r.raise_for_status()
+            body = r.json()
+        _log(f"getWebhookInfo response: {body}")
+    except Exception as exc:
+        _log(f"getWebhookInfo check failed: {exc!r}")
+
+
 def _fmt_msg(msg: dict) -> dict:
     sender = msg.get("from") or {}
     name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))
@@ -410,6 +428,7 @@ if __name__ == "__main__":
     if os.environ.get("RESET_OFFSET", "").strip().lower() in ("true", "1"):
         _set_state("last_update_id", "0")
         _log("RESET_OFFSET environment variable detected; reset last_update_id to 0")
+    _log_webhook_info()
     _start_poll_thread()
     port = int(os.environ.get("PORT", 8080))
     mcp.run(transport="sse", host="0.0.0.0", port=port)
