@@ -19,7 +19,6 @@ except Exception:
     _PT_TZ = timezone(timedelta(hours=-7))
 
 _DAILY_SYNC_HOUR_PT = 14  # 2pm PT
-_MICRO_SYNC_INTERVAL_SECONDS = 30 * 60  # every 30 minutes
 _THREAD_RESTART_DELAY_SECONDS = 30
 
 
@@ -178,22 +177,6 @@ def _next_daily_sync_at(now_utc: datetime) -> datetime:
     return candidate_pt.astimezone(timezone.utc)
 
 
-async def _micro_sync_loop() -> None:
-    """
-    Every _MICRO_SYNC_INTERVAL_SECONDS, attempt a quick incremental fetch so
-    messages sent between the daily syncs still show up promptly. Failures
-    here are logged but never propagate — this loop must not die.
-    """
-    while True:
-        await asyncio.sleep(_MICRO_SYNC_INTERVAL_SECONDS)
-        try:
-            n = await fetch_and_store()
-            if n:
-                _log(f"micro-sync stored {n} new message(s)")
-        except Exception as exc:
-            _log(f"micro-sync failed (will retry in {_MICRO_SYNC_INTERVAL_SECONDS}s): {exc!r}")
-
-
 async def _daily_sync_loop() -> None:
     """
     Sleep until the next 2pm PT (9pm UTC during PDT) and run a full sync,
@@ -216,7 +199,7 @@ async def _daily_sync_loop() -> None:
 async def _poll_forever() -> None:
     """
     Fetch on startup (covers any gap since the last run), then run the daily
-    2pm PT sync and the 30-minute micro-sync concurrently, forever.
+    2pm PT sync loop, forever.
     """
     try:
         n = await fetch_and_store()
@@ -224,7 +207,7 @@ async def _poll_forever() -> None:
     except Exception as exc:
         _log(f"startup sync failed: {exc!r}")  # don't abort the loop on a transient startup error
 
-    await asyncio.gather(_daily_sync_loop(), _micro_sync_loop())
+    await _daily_sync_loop()
 
 
 def _start_poll_thread() -> None:
