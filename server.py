@@ -396,6 +396,9 @@ async def get_chat_info() -> dict:
 
 if __name__ == "__main__":
     init_db()
+    if os.environ.get("RESET_OFFSET", "").strip().lower() in ("true", "1"):
+        _set_state("last_update_id", "0")
+        _log("RESET_OFFSET environment variable detected; reset last_update_id to 0")
     _start_poll_thread()
     port = int(os.environ.get("PORT", 8080))
     mcp.run(transport="sse", host="0.0.0.0", port=port)
