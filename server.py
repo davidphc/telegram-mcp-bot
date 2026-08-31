@@ -342,6 +342,23 @@ async def send_message(text: str) -> dict:
 
 
 @mcp.tool()
+def reset_offset() -> dict:
+    """
+    Reset the stored last_update_id back to 0, discarding the current offset
+    into Telegram's update queue. Use this when the offset has gone stale
+    (older than Telegram's ~24h update retention window), which causes
+    getUpdates to return an empty array forever. After resetting, the next
+    sync will start fresh from the current head of Telegram's update queue;
+    messages sent before the reset that were already dropped by Telegram
+    cannot be recovered, but new messages will be captured going forward.
+    """
+    old_value = _get_state("last_update_id", "0")
+    _set_state("last_update_id", "0")
+    _log(f"reset_offset: old={old_value}, new=0")
+    return {"status": "ok", "old_value": old_value, "new_value": "0"}
+
+
+@mcp.tool()
 async def get_chat_info() -> dict:
     """
     Return metadata about the configured Telegram chat plus local database stats
