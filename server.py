@@ -37,8 +37,25 @@ if not BOT_TOKEN:
 if not CHAT_ID:
     raise RuntimeError("CHAT_ID environment variable is required")
 
+try:
+    _CHAT_ID_INT = int(CHAT_ID)
+except ValueError as exc:
+    raise RuntimeError(f"CHAT_ID must be a valid integer (got {CHAT_ID!r})") from exc
+
 _BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 mcp   = FastMCP("telegram")
+
+
+def _mask_token(token: str) -> str:
+    return f"...{token[-8:]}" if len(token) >= 8 else "***"
+
+
+def _log_startup_debug_info() -> None:
+    db_exists = os.path.exists(DB_PATH)
+    _log(
+        f"startup config: BOT_TOKEN={_mask_token(BOT_TOKEN)} "
+        f"CHAT_ID(parsed)={_CHAT_ID_INT} DB_PATH={DB_PATH} (exists={db_exists})"
+    )
 
 # ── Database ───────────────────────────────────────────────────────────────────
 
@@ -103,14 +120,56 @@ def _store_messages(rows: list[dict]) -> None:
 
 # ── Telegram helpers ───────────────────────────────────────────────────────────
 
+_CONFLICT_MAX_RETRIES = 3
+_CONFLICT_BACKOFF_START_SECONDS = 1
+_CONFLICT_BACKOFF_MAX_SECONDS = 10
+
+
 async def _call(method: str, payload: dict | None = None) -> object:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(f"{_BASE}/{method}", json=payload or {})
-        r.raise_for_status()
-        body = r.json()
-        if not body.get("ok"):
-            raise RuntimeError(body.get("description", "Telegram API error"))
-        return body["result"]
+    """
+    Call a Telegram Bot API method.
+
+    getUpdates in particular can return HTTP 409 Conflict if another process
+    (or a leftover overlapping request) is polling the same bot token
+    concurrently. Rather than propagating that error and aborting the whole
+    sync, retry with exponential backoff. If retries are exhausted, raise so
+    the caller can decide how to proceed (fetch_and_store treats this as
+    non-fatal and keeps whatever it already fetched).
+    """
+    backoff = _CONFLICT_BACKOFF_START_SECONDS
+    last_exc: Exception | None = None
+
+    for attempt in range(1, _CONFLICT_MAX_RETRIES + 2):  # initial try + retries
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(f"{_BASE}/{method}", json=payload or {})
+                r.raise_for_status()
+                body = r.json()
+                if not body.get("ok"):
+                    raise RuntimeError(body.get("description", "Telegram API error"))
+                return body["result"]
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 409:
+                last_exc = exc
+                if attempt > _CONFLICT_MAX_RETRIES:
+                    _log(
+                        f"{method}: giving up after {_CONFLICT_MAX_RETRIES} retries "
+                        f"on 409 Conflict: {exc!r}"
+                    )
+                    raise
+                _log(
+                    f"{method}: got 409 Conflict (attempt {attempt}/{_CONFLICT_MAX_RETRIES}), "
+                    f"retrying in {backoff}s"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _CONFLICT_BACKOFF_MAX_SECONDS)
+                continue
+            raise
+
+    # Should be unreachable, but keep mypy/linters happy and avoid silent None return.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{method}: exhausted retries with no response")
 
 
 def _fmt_msg(msg: dict) -> dict:
@@ -131,6 +190,11 @@ async def fetch_and_store() -> int:
     Passes the last seen update_id as offset so Telegram advances the queue pointer.
     Loops until fewer than 100 updates are returned (queue exhausted).
     Returns the number of messages stored this run.
+
+    getUpdates 409 Conflicts are retried internally by `_call()`. If retries
+    are exhausted on a given iteration, we stop draining further but keep
+    (and persist) whatever was already fetched in this run instead of
+    propagating the exception and losing progress.
     """
     last_update_id = int(_get_state("last_update_id", "0"))
     total = 0
@@ -143,16 +207,48 @@ async def fetch_and_store() -> int:
         if last_update_id > 0:
             params["offset"] = last_update_id + 1
 
-        updates = await _call("getUpdates", params)
+        try:
+            updates = await _call("getUpdates", params)
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 409:
+                _log(
+                    "getUpdates: exhausted 409 Conflict retries for this iteration; "
+                    f"stopping this sync run with {total} message(s) stored so far "
+                    "(will retry on the next scheduled sync)"
+                )
+                break
+            raise
+
+        _log(f"getUpdates returned {len(updates)} update(s)")
+
         if not updates:
             break
 
         rows: list[dict] = []
         for u in updates:
             msg = u.get("message") or u.get("channel_post")
-            if msg and str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
+            update_id = u.get("update_id")
+
+            if not msg:
+                _log(f"update_id={update_id}: no message/channel_post payload, skipping")
+                last_update_id = max(last_update_id, update_id)
+                continue
+
+            actual_chat_id = msg.get("chat", {}).get("id")
+            sender = msg.get("from") or {}
+            sender_name = " ".join(
+                filter(None, [sender.get("first_name"), sender.get("last_name")])
+            ) or sender.get("username") or "Unknown"
+            passed_filter = str(actual_chat_id) == str(CHAT_ID)
+
+            _log(
+                f"update_id={update_id} chat_id={actual_chat_id} sender={sender_name!r} "
+                f"passed_chat_id_filter={passed_filter}"
+            )
+
+            if passed_filter:
                 rows.append(_fmt_msg(msg))
-            last_update_id = max(last_update_id, u["update_id"])
+            last_update_id = max(last_update_id, update_id)
 
         _store_messages(rows)
         total += len(rows)
@@ -237,6 +333,9 @@ def _start_poll_thread() -> None:
     event loop rather than exiting silently. This guarantees syncing keeps
     happening even after unexpected errors.
     """
+    _log(f"CHAT_ID parsed successfully as int: {_CHAT_ID_INT}")
+    _log_startup_debug_info()
+
     def runner() -> None:
         while True:
             try:
